@@ -97,6 +97,9 @@ if [[ ${configure_egress_input,,} == "y" ]]; then
   read -ep "Enter the outbound (egress) IP:"$'\n' input_egress_ip
 fi
 
+configure_ipdetect_input="n"
+read -ep "Do you want to block IP/geo-detection services (so apps can't discover the egress IP)? [y/N] "$'\n' configure_ipdetect_input
+
 # Check congestion protocol
 if sysctl net.ipv4.tcp_congestion_control | grep bbr; then
     echo "BBR is already used"
@@ -234,7 +237,41 @@ marzban_setup() {
 XRAYCFG
 }
 
+block_ip_geo_detect() {
+  local cfg_path="$1"
+  if ! wget -qO- https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/category-ip-geo-detect.json > /tmp/category-ip-geo-detect.json; then
+    echo "Warning: could not download IP/geo-detection list, skipping"
+    return 0
+  fi
+  CFG_PATH="$cfg_path" python3 - <<'PYEOF'
+import json, os
+with open('/tmp/category-ip-geo-detect.json') as f:
+    data = json.load(f)
+matchers = []
+for rule in data.get('rules', []):
+    for d in rule.get('domain', []):
+        matchers.append('full:' + d)
+    for d in rule.get('domain_suffix', []):
+        matchers.append('domain:' + d)
+with open(os.environ['CFG_PATH']) as f:
+    cfg = json.load(f)
+cfg.setdefault('routing', {}).setdefault('rules', [])
+cfg['routing']['rules'].insert(0, {
+    'type': 'field',
+    'domain': matchers,
+    'outboundTag': 'block'
+})
+with open(os.environ['CFG_PATH'], 'w') as f:
+    json.dump(cfg, f, indent=2)
+print('Blocked', len(matchers), 'IP/geo-detection domains')
+PYEOF
+}
+
 marzban_setup
+
+if [[ ${configure_ipdetect_input,,} == "y" ]]; then
+  block_ip_geo_detect "/opt/xray-vps-setup/marzban/xray_config.json"
+fi
 
 sshd_edit() {
   wget -qO- https://raw.githubusercontent.com/$GIT_REPO/refs/heads/$GIT_BRANCH/templates_for_script/00-disable-password | envsubst > /etc/ssh/sshd_config.d/00-disable-password.conf
