@@ -91,10 +91,137 @@ write_xray_config() {
 XRAYCFG
 }
 
+ip_geo_detect_url=https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/category-ip-geo-detect.json
+
+add_ip_geo_detect_rule() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+
+config_path, list_path = sys.argv[1:]
+with open(list_path) as f:
+    categories = json.load(f)
+matchers = [
+    prefix + name
+    for rule in categories.get("rules", [])
+    for key, prefix in (("domain", "full:"), ("domain_suffix", "domain:"))
+    for name in rule.get(key, [])
+]
+if not matchers:
+    sys.exit("IP/geo-detection list contains no domains")
+with open(config_path) as f:
+    cfg = json.load(f)
+cfg.setdefault("routing", {}).setdefault("rules", []).insert(0, {
+    "type": "field",
+    "domain": matchers,
+    "outboundTag": "block",
+})
+with open(config_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print("Blocked", len(matchers), "IP/geo-detection domains")
+PY
+}
+
 # The reuse path exits before the fresh install can modify the host.
 reuse_fail() {
   printf 'Marzban --reuse: %s\n' "$*" >&2
   exit 1
+}
+
+reuse_read() {
+  printf '%s' "$1" >&"$prompt_fd"
+  IFS= read -r -u "$prompt_fd" "$2" || reuse_fail 'input ended before all installation options were entered'
+}
+
+reuse_ask() {
+  local answer
+  while true; do
+    reuse_read "$1 [y/N] " answer
+    case ${answer,,} in
+      y|yes) return 0 ;;
+      n|no|'') return 1 ;;
+    esac
+    printf 'Please enter y or n.\n' >&"$prompt_fd"
+  done
+}
+
+reuse_local_egress() {
+  ip -j address show | python3 -c '
+import ipaddress, json, sys
+
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+for interface in json.load(sys.stdin):
+    for info in interface.get("addr_info", []):
+        if info.get("scope") == "global" and ipaddress.ip_address(info["local"]) == address:
+            print(address)
+            sys.exit(0)
+sys.exit(1)
+' "$1"
+}
+
+reuse_prompt_options() {
+  local egress_input
+  if [[ -z $prompt_fd ]]; then
+    printf 'Marzban --reuse: no controlling terminal. Using system-selected egress and leaving WARP routing and IP/geo-detection blocking disabled.\n' >&2
+    return 0
+  fi
+  if reuse_ask 'Use the existing WARP proxy for Russian domains?'; then
+    use_warp=yes
+  fi
+  if reuse_ask 'Use a separate egress IP for direct Xray traffic?'; then
+    reuse_read 'Enter an IP address assigned to this host: ' egress_input
+    command -v ip >/dev/null || reuse_fail 'the ip command is required to check the egress address'
+    egress=$(reuse_local_egress "$egress_input") || reuse_fail 'the egress address must be a usable IP assigned to this host'
+  fi
+  if reuse_ask 'Block IP and geolocation detection services?'; then
+    block_ip_detect=yes
+  fi
+  if [[ $use_warp == yes ]] &&
+    ! reuse_curl --fail --noproxy '' --max-time 12 --socks5-hostname 127.0.0.1:40000 \
+      https://www.cloudflare.com/cdn-cgi/trace | grep -qx 'warp=on'; then
+    reuse_fail 'WARP was requested but the SOCKS proxy on 127.0.0.1:40000 is not connected to WARP'
+  fi
+}
+
+reuse_configure_xray() {
+  local config=$1 list=$work/ip-geo-detect.json
+  if [[ -n $egress || $use_warp == yes ]]; then
+    python3 - "$config" "$egress" "$use_warp" <<'PY'
+import ipaddress, json, sys
+
+path, egress, warp = sys.argv[1:]
+with open(path) as f:
+    cfg = json.load(f)
+if egress:
+    direct = next(outbound for outbound in cfg["outbounds"] if outbound["tag"] == "direct")
+    direct["settings"].pop("sendThrough", None)
+    direct["sendThrough"] = egress
+    if ipaddress.ip_address(egress).version == 6:
+        direct["settings"]["domainStrategy"] = "UseIPv6"
+        cfg["dns"]["queryStrategy"] = "UseIPv6"
+if warp == "yes":
+    cfg["outbounds"].append({
+        "tag": "warp",
+        "protocol": "socks",
+        "settings": {"servers": [{"address": "127.0.0.1", "port": 40000}]},
+    })
+    cfg["routing"]["rules"].append({
+        "type": "field",
+        "domain": ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai"],
+        "outboundTag": "warp",
+    })
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+PY
+  fi
+  if [[ $block_ip_detect == yes ]]; then
+    reuse_curl --fail --show-error --location --max-time 20 --output "$list" "$ip_geo_detect_url" &&
+      add_ip_geo_detect_rule "$config" "$list" ||
+      reuse_fail 'could not load the requested IP/geo-detection block list'
+    rm -- "$list"
+  fi
 }
 
 reuse_compose() {
@@ -377,6 +504,7 @@ marzban_reuse() (
   umask 077
   local domain=${1:-} tool endpoint discovery caddy data old old_policy current data_device
   local work project image_id candidate='' activated=0 keys password file xray_source=''
+  local prompt_fd='' use_warp=no block_ip_detect=no egress=''
   local dashboard_path=/dashboard/ subscription_path=sub paths
   local base=/opt/xray-vps-setup
   local root=$base/marzban-reuse pending=$base/marzban-reuse/pending
@@ -384,8 +512,13 @@ marzban_reuse() (
   local -a compose topology db_files=(db.sqlite3 db.sqlite3-wal db.sqlite3-shm db.sqlite3-journal)
   local domain_pattern='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
   (($# <= 1)) || reuse_fail "usage: $0 --reuse [domain]"
+  # Bash may be reading this script from stdin. Read answers from the terminal.
+  if ! { exec {prompt_fd}<>/dev/tty; } 2>/dev/null; then
+    prompt_fd=''
+  fi
   if [[ -z $domain ]]; then
-    read -erp 'Enter the existing Caddy domain: ' domain || reuse_fail 'a Caddy domain is required'
+    [[ -n $prompt_fd ]] || reuse_fail 'pass the Caddy domain as an argument when running without a terminal'
+    reuse_read 'Enter the existing Caddy domain: ' domain
   fi
   domain=${domain,,}
   domain=${domain%.}
@@ -465,6 +598,11 @@ print(DASHBOARD_PATH, XRAY_SUBSCRIPTION_PATH)
   [[ $data_device == "$(stat -c %d -- "$root")" ]] ||
     reuse_fail 'the shared data directory and backup location must be on the same filesystem'
 
+  reuse_prompt_options
+  if [[ -n $prompt_fd ]]; then
+    exec {prompt_fd}>&-
+  fi
+
   work=$(mktemp -d "$root/run.XXXXXXXXXX")
   project=marzban-reuse-${work##*.}
   project=${project,,}
@@ -495,6 +633,7 @@ print(DASHBOARD_PATH, XRAY_SUBSCRIPTION_PATH)
   XRAY_PATH=$(openssl rand -hex 8)
   write_xray_config python3 -c 'import os, sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' > "$work/xray_config.json"
   unset keys XRAY_PIK XRAY_PBK
+  reuse_configure_xray "$work/xray_config.json"
   password=$(openssl rand -hex 24)
   printf 'SUDO_USERNAME=admin\nSUDO_PASSWORD=%s\n' "$password" > "$work/admin.env"
   printf 'username=admin&password=%s' "$password" > "$work/login-form"
@@ -724,32 +863,11 @@ marzban_setup() {
 
 block_ip_geo_detect() {
   local cfg_path="$1"
-  if ! wget -qO- https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/refs/heads/sing/geo/geosite/category-ip-geo-detect.json > /tmp/category-ip-geo-detect.json; then
+  if ! wget -qO- "$ip_geo_detect_url" > /tmp/category-ip-geo-detect.json; then
     echo "Warning: could not download IP/geo-detection list, skipping"
     return 0
   fi
-  CFG_PATH="$cfg_path" python3 - <<'PYEOF'
-import json, os
-with open('/tmp/category-ip-geo-detect.json') as f:
-    data = json.load(f)
-matchers = []
-for rule in data.get('rules', []):
-    for d in rule.get('domain', []):
-        matchers.append('full:' + d)
-    for d in rule.get('domain_suffix', []):
-        matchers.append('domain:' + d)
-with open(os.environ['CFG_PATH']) as f:
-    cfg = json.load(f)
-cfg.setdefault('routing', {}).setdefault('rules', [])
-cfg['routing']['rules'].insert(0, {
-    'type': 'field',
-    'domain': matchers,
-    'outboundTag': 'block'
-})
-with open(os.environ['CFG_PATH'], 'w') as f:
-    json.dump(cfg, f, indent=2)
-print('Blocked', len(matchers), 'IP/geo-detection domains')
-PYEOF
+  add_ip_geo_detect_rule "$cfg_path" /tmp/category-ip-geo-detect.json
 }
 
 marzban_setup
