@@ -9,6 +9,569 @@ set -e
 export GIT_BRANCH="main"
 export GIT_REPO="Akiyamov/xray-vps-setup"
 
+write_xray_config() {
+  "$@" <<'XRAYCFG'
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "tag": "VLESS XHTTP REALITY",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "xver": 1,
+          "dest": "127.0.0.1:4123",
+          "serverNames": [
+            "$VLESS_DOMAIN"
+          ],
+          "privateKey": "$XRAY_PIK",
+          "publicKey": "$XRAY_PBK",
+          "shortIds": [
+            ""
+          ]
+        },
+        "xhttpSettings": {
+          "host": "$VLESS_DOMAIN",
+          "path": "/$XRAY_PATH"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "settings": {
+        "domainStrategy": "UseIPv4",
+        "sendThrough": "$XRAY_SEND_THROUGH"
+      }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "protocol": "bittorrent",
+        "outboundTag": "block"
+      }
+    ],
+    "domainStrategy": "IPIfNonMatch"
+  },
+  "dns": {
+    "servers": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "queryStrategy": "UseIPv4",
+    "disableFallback": false,
+    "tag": "dns-aux"
+  }
+}
+XRAYCFG
+}
+
+# The reuse path exits before the fresh install can modify the host.
+reuse_fail() {
+  printf 'Marzban --reuse: %s\n' "$*" >&2
+  exit 1
+}
+
+reuse_compose() {
+  local variant=$1
+  shift
+  "${compose[@]}" --env-file /dev/null -p "$project-$variant" -f "$work/$variant.json" "$@"
+}
+
+reuse_discover() {
+  local running
+  local -a ids
+  running=$(docker ps -q --no-trunc) || return 1
+  if [[ -z $running ]]; then
+    printf 'Marzban --reuse: no running Docker containers found.\n' >&2
+    return 1
+  fi
+  mapfile -t ids <<< "$running"
+  docker inspect "${ids[@]}" | python3 -c '
+import json, os, sys
+
+def fail(message):
+    sys.exit("Marzban --reuse: " + message)
+
+def mounts(container, path):
+    return [m for m in container["Mounts"] if
+            m["Destination"] == path or m["Destination"].startswith(path + "/")]
+
+def image(container):
+    return container["Config"]["Image"].split("@")[0].rsplit("/", 1)[-1].split(":")[0]
+
+def host_network(container):
+    return container["HostConfig"]["NetworkMode"] == "host"
+
+containers = json.load(sys.stdin)
+caddies = []
+for container in containers:
+    labels = container["Config"].get("Labels") or {}
+    if image(container) != "caddy" and labels.get("com.docker.compose.service") != "caddy":
+        continue
+    found = mounts(container, "/run/marzban")
+    if host_network(container) and len(found) == 1:
+        mount = found[0]
+        if mount["Type"] == "bind" and mount["Destination"] == "/run/marzban":
+            caddies.append((container, mount["Source"]))
+if len(caddies) != 1:
+    fail("expected exactly one running host-network Caddy with a bind mount at /run/marzban")
+caddy, source = caddies[0]
+data = os.path.realpath(source)
+if data != source or not os.path.isabs(data) or data == "/" or any(c in data for c in "\n\r$"):
+    fail("Caddy socket bind mount has an unsupported source path")
+
+old = []
+for container in containers:
+    for bindings in (container["HostConfig"].get("PortBindings") or {}).values():
+        if any(binding["HostPort"] == "443" for binding in bindings or []):
+            fail("a Docker container publishes port 443")
+    if container["Id"] == caddy["Id"]:
+        continue
+    for mount in container["Mounts"]:
+        if not mount["RW"] or mount["Type"] not in ("bind", "volume"):
+            continue
+        mounted = os.path.realpath(mount["Source"])
+        if os.path.commonpath([mounted, data]) not in (mounted, data):
+            continue
+        if (image(container) != "marzban" or not host_network(container)
+                or mount["Type"] != "bind" or mounted != data
+                or mount["Destination"] != "/var/lib/marzban"):
+            fail("another running container can write to the shared Marzban directory")
+        old.append(container)
+if len(old) > 1:
+    fail("multiple running Marzban containers share the Caddy socket directory")
+
+print(caddy["Id"], data, sep="\n")
+if old:
+    policy = old[0]["HostConfig"]["RestartPolicy"]
+    name = policy["Name"] or "no"
+    if name == "on-failure" and policy["MaximumRetryCount"]:
+        name += ":" + str(policy["MaximumRetryCount"])
+    print(old[0]["Id"], name, sep="\n")
+'
+}
+
+reuse_listener() {
+  local container=$1 process=$2 port=$3 binding=$4 listeners pids
+  listeners=$(ss -H -ltnp "sport = :$port") || return 1
+  if [[ -z $container ]]; then
+    [[ -z $listeners ]]
+    return
+  fi
+  pids=$(docker top "$container" -eo pid) || return 1
+  python3 -c '
+import re, sys
+process, binding, *pids = sys.argv[1:]
+rows = sys.stdin.read().splitlines()
+if not rows:
+    sys.exit(1)
+for row in rows:
+    fields = row.split(maxsplit=5)
+    if len(fields) != 6 or fields[3] not in binding.split(","):
+        sys.exit(1)
+    owners = re.findall(r"\(\"([^\"]+)\",pid=(\d+),fd=\d+\)", fields[5])
+    if not owners or len(owners) != fields[5].count("pid="):
+        sys.exit(1)
+    if any(name != process or pid not in pids for name, pid in owners):
+        sys.exit(1)
+' "$process" "$binding" $pids <<< "$listeners"
+}
+
+reuse_xray_listener() {
+  reuse_listener "$1" xray 443 '0.0.0.0:443,*:443,[::]:443'
+}
+
+reuse_caddy_config() {
+  docker exec "$caddy" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null |
+    python3 -c '
+import json, sys
+
+def objects(item):
+    if isinstance(item, dict):
+        yield item
+        for value in item.values():
+            yield from objects(value)
+    elif isinstance(item, list):
+        for value in item:
+            yield from objects(value)
+
+cfg = json.load(sys.stdin)
+for server in cfg["apps"]["http"]["servers"].values():
+    if server.get("listen") != ["127.0.0.1:4123"]:
+        continue
+    if [w.get("wrapper") for w in server.get("listener_wrappers", [])][:2] != ["proxy_protocol", "tls"]:
+        continue
+    for route in objects(server.get("routes", [])):
+        if not any(sys.argv[1] in match.get("host", []) for match in route.get("match", [])):
+            continue
+        upstreams = {item["dial"] for item in objects(route.get("handle", [])) if "dial" in item}
+        if {"127.0.0.1:18089", "unix//run/marzban/marzban.socket"} <= upstreams:
+            sys.exit(0)
+sys.exit(1)
+' "$domain" 2>/dev/null
+}
+
+reuse_curl() {
+  curl --disable --noproxy '*' --silent --connect-timeout 2 --max-time 4 "$@"
+}
+
+reuse_photo_health() {
+  reuse_curl --fail "$@" | python3 -c 'import json, sys; sys.exit(json.load(sys.stdin).get("status") != "ok")' 2>/dev/null
+}
+
+reuse_panel_ready() {
+  local status
+  status=$(reuse_curl --output /dev/null --write-out '%{http_code}' "$@") && [[ $status == 401 ]]
+}
+
+reuse_wait() {
+  local attempt
+  for ((attempt=0; attempt<30; attempt++)); do
+    "$@" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+reuse_write_compose() {
+  local variant=$1 network=$2 source=$3 restart=$4
+  python3 - "$network" "$source" "$restart" "$project-$variant" "$domain" "$image_id" \
+    "$dashboard_path" "$subscription_path" > "$work/$variant.json" <<'PY'
+import json, sys
+
+network, source, restart, name, domain, image, dashboard, subscription = sys.argv[1:]
+volumes = [
+    (source, "/var/lib/marzban", False),
+    ("./xray", "/usr/local/bin/xray", True),
+    ("./xray_config.json", "/code/xray_config.json", True),
+]
+json.dump({"services": {"marzban": {
+    "image": image,
+    "container_name": name,
+    "network_mode": network,
+    "restart": restart,
+    "environment": {
+        "SQLALCHEMY_DATABASE_URL": "sqlite:////var/lib/marzban/db.sqlite3",
+        "UVICORN_UDS": "/var/lib/marzban/marzban.socket",
+        "XRAY_JSON": "/code/xray_config.json",
+        "DASHBOARD_PATH": dashboard,
+        "XRAY_SUBSCRIPTION_PATH": subscription,
+        "XRAY_SUBSCRIPTION_URL_PREFIX": "https://" + domain,
+    },
+    "volumes": [
+        {"type": "bind", "source": src, "target": dst, "read_only": ro}
+        for src, dst, ro in volumes
+    ],
+}}}, sys.stdout, indent=2)
+PY
+}
+
+reuse_seed_panel() {
+  local socket=$work/stage-data/marzban.socket token
+  local api=(--unix-socket "$socket" --fail)
+  docker exec --env-file "$work/admin.env" "$project-stage" \
+    marzban-cli admin import-from-env --yes >/dev/null 2>&1 || return 1
+  token=$(reuse_curl "${api[@]}" --data-binary "@$work/login-form" http://localhost/api/admin/token |
+    python3 -c 'import json, re, sys; token = json.load(sys.stdin)["access_token"]; sys.exit(1) if not re.fullmatch(r"[\w.-]+", token) else print(token)' 2>/dev/null) || return 1
+  printf 'Authorization: Bearer %s\n' "$token" > "$work/auth-header" || return 1
+  reuse_curl "${api[@]}" -H "@$work/auth-header" http://localhost/api/hosts |
+    python3 -c '
+import json, sys
+domain, path = sys.argv[1:]
+hosts = json.load(sys.stdin)
+if not any(hosts.values()):
+    sys.exit(1)
+for entries in hosts.values():
+    for host in entries:
+        host.update(address=domain, sni=domain, host=domain, path=path,
+                    security="inbound_default", fingerprint="chrome")
+json.dump(hosts, sys.stdout)
+' "$domain" "/$XRAY_PATH" 2>/dev/null > "$work/hosts.json" || return 1
+  reuse_curl "${api[@]}" -o /dev/null -X PUT -H "@$work/auth-header" \
+    -H 'Content-Type: application/json' --data-binary "@$work/hosts.json" http://localhost/api/hosts
+}
+
+reuse_cleanup() {
+  local result=$1 file rollback_ok=1 remaining
+  trap - EXIT
+  trap '' INT TERM HUP
+  set +e
+  if [[ -L $root/current && $(readlink "$root/current") == "$work" ]]; then
+    exit "$result"
+  fi
+  if [[ -n $xray_source ]]; then
+    docker rm -v "$xray_source" >/dev/null 2>&1
+  fi
+  rm -f -- "$work/login-form" "$work/auth-header"
+  if [[ -L $pending && $(readlink "$pending") == "$work" ]]; then
+    printf 'Marzban --reuse: switching failed, restoring the previous state.\n' >&2
+    if ! docker rm -f "$candidate" >/dev/null 2>&1; then
+      remaining=$(docker ps -aq --filter "id=$candidate" 2>/dev/null) && [[ -z $remaining ]] || rollback_ok=0
+    fi
+    if ((rollback_ok && activated)); then
+      for file in "${db_files[@]}" marzban.socket; do
+        if [[ -e $data/$file || -L $data/$file || -S $data/$file ]]; then
+          mv -T -- "$data/$file" "$work/failed/$file" || rollback_ok=0
+        fi
+      done
+    fi
+    if ((rollback_ok)); then
+      for file in "${db_files[@]}"; do
+        if [[ -f $work/backup/$file ]]; then
+          mv -T -- "$work/backup/$file" "$data/$file" || rollback_ok=0
+        fi
+      done
+      if ((rollback_ok)) && [[ -n $old ]]; then
+        docker update --restart "$old_policy" "$old" >/dev/null 2>&1 &&
+          docker start "$old" >/dev/null 2>&1 &&
+          reuse_wait reuse_xray_listener "$old" &&
+          reuse_wait reuse_panel_ready --unix-socket "$data/marzban.socket" http://localhost/api/admin ||
+          rollback_ok=0
+      fi
+    fi
+    if ((rollback_ok)) && rm -- "$pending"; then
+      printf 'Marzban --reuse: previous state restored.\n' >&2
+    else
+      printf 'Marzban --reuse: rollback incomplete, recovery files are in %s.\n' "$work" >&2
+    fi
+  elif ((result != 0)); then
+    if [[ -f $work/stage.json ]]; then
+      reuse_compose stage rm --stop --force >/dev/null 2>&1
+    fi
+    if [[ -f $work/live.json ]]; then
+      reuse_compose live rm --stop --force >/dev/null 2>&1
+    fi
+  fi
+  exit "$result"
+}
+
+marzban_reuse() (
+  set +x
+  set -eo pipefail
+  umask 077
+  local domain=${1:-} tool endpoint discovery caddy data old old_policy current data_device
+  local work project image_id candidate='' activated=0 keys password file xray_source=''
+  local dashboard_path=/dashboard/ subscription_path=sub paths
+  local base=/opt/xray-vps-setup
+  local root=$base/marzban-reuse pending=$base/marzban-reuse/pending
+  local image=gozargah/marzban:v0.8.4 xray_image=ghcr.io/xtls/xray-core:26.3.27
+  local -a compose topology db_files=(db.sqlite3 db.sqlite3-wal db.sqlite3-shm db.sqlite3-journal)
+  local domain_pattern='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+  (($# <= 1)) || reuse_fail "usage: $0 --reuse [domain]"
+  if [[ -z $domain ]]; then
+    read -erp 'Enter the existing Caddy domain: ' domain || reuse_fail 'a Caddy domain is required'
+  fi
+  domain=${domain,,}
+  domain=${domain%.}
+  [[ ${#domain} -le 253 && $domain =~ $domain_pattern ]] || reuse_fail 'enter a valid DNS name (use Punycode for IDN)'
+  for tool in docker curl ss flock openssl python3; do
+    command -v "$tool" >/dev/null || reuse_fail "required command is missing: $tool"
+  done
+  if [[ -n ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]]; then
+    endpoint=$DOCKER_HOST
+  else
+    endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) ||
+      reuse_fail 'cannot determine the Docker endpoint'
+  fi
+  [[ $endpoint == unix:///* ]] || reuse_fail 'a local Unix-socket Docker endpoint is required'
+  export DOCKER_HOST="$endpoint"
+  unset DOCKER_CONTEXT
+  docker info >/dev/null 2>&1 || reuse_fail 'local Docker is unavailable'
+  if docker compose version >/dev/null 2>&1; then
+    compose=(docker compose)
+  elif docker-compose version >/dev/null 2>&1; then
+    compose=(docker-compose)
+  else
+    reuse_fail 'Docker Compose is unavailable'
+  fi
+
+  install -d -m 700 -- "$root"
+  exec 9>"$root/lock"
+  flock -n 9 || reuse_fail 'another reuse operation holds the lock'
+  [[ ! -e $pending && ! -L $pending ]] || reuse_fail "an interrupted switch needs recovery: $pending"
+
+  discovery=$(reuse_discover) || reuse_fail 'cannot identify a safe Caddy and Marzban topology'
+  mapfile -t topology <<< "$discovery"
+  caddy=${topology[0]} data=${topology[1]} old=${topology[2]:-} old_policy=${topology[3]:-}
+  [[ -d $data ]] || reuse_fail 'the Caddy socket bind source does not exist'
+  reuse_listener "$caddy" caddy 4123 '127.0.0.1:4123' ||
+    reuse_fail 'Caddy does not exclusively own the expected loopback TCP 4123 listener'
+  reuse_xray_listener "$old" || reuse_fail 'TCP 443 is not free or exclusively owned by the matching Marzban Xray'
+  reuse_caddy_config || reuse_fail 'Caddy does not declare the requested domain, PROXY/TLS listener and both expected upstreams'
+  reuse_photo_health http://127.0.0.1:18089/api/health ||
+    reuse_fail 'the local PhotoHunt API is not healthy'
+  local photo_url=https://$domain/photohunt/api/health
+  local panel_url=https://$domain/api/admin
+  local -a via_caddy=(--haproxy-protocol --connect-to "$domain:443:127.0.0.1:4123")
+  reuse_photo_health "${via_caddy[@]}" "$photo_url" ||
+    reuse_fail 'Caddy failed the local PhotoHunt check with verified TLS and PROXY protocol'
+  if [[ -n $old ]]; then
+    [[ -f $data/db.sqlite3 ]] &&
+      reuse_panel_ready --unix-socket "$data/marzban.socket" http://localhost/api/admin &&
+      reuse_panel_ready "${via_caddy[@]}" "$panel_url" ||
+      reuse_fail 'the existing Marzban SQLite database or API is unavailable'
+  fi
+  if [[ -L $root/current ]]; then
+    current=$(readlink "$root/current")
+    [[ -n $old && -f $current/container && $old == "$(<"$current/container")" ]] ||
+      reuse_fail "a previous reuse project exists but is not active: $current"
+    reuse_photo_health "$photo_url" || reuse_fail 'the active project failed the public PhotoHunt health check'
+    printf 'Marzban --reuse: existing project is healthy. Files: %s\n' "$current"
+    exit 0
+  fi
+  if [[ -n $old ]]; then
+    paths=$(docker exec "$old" python -c '
+import re, sys
+from config import DASHBOARD_PATH, SQLALCHEMY_DATABASE_URL, UVICORN_UDS, XRAY_SUBSCRIPTION_PATH
+
+if (SQLALCHEMY_DATABASE_URL != "sqlite:////var/lib/marzban/db.sqlite3"
+        or UVICORN_UDS != "/var/lib/marzban/marzban.socket"
+        or not re.fullmatch(r"/[a-zA-Z0-9_/-]+", DASHBOARD_PATH)
+        or not re.fullmatch(r"[a-zA-Z0-9_/-]+", XRAY_SUBSCRIPTION_PATH)):
+    sys.exit(1)
+print(DASHBOARD_PATH, XRAY_SUBSCRIPTION_PATH)
+' 2>/dev/null) || reuse_fail 'the existing Marzban does not use the expected SQLite and socket settings or has unsupported panel paths'
+    read -r dashboard_path subscription_path <<< "$paths"
+  fi
+  [[ $root != "$data" && $root != "$data/"* && $data != "$root/"* ]] ||
+    reuse_fail 'the shared data and reuse project directories must not overlap'
+  data_device=$(stat -c %d -- "$data") || reuse_fail 'cannot inspect the shared data filesystem'
+  [[ $data_device == "$(stat -c %d -- "$root")" ]] ||
+    reuse_fail 'the shared data directory and backup location must be on the same filesystem'
+
+  work=$(mktemp -d "$root/run.XXXXXXXXXX")
+  project=marzban-reuse-${work##*.}
+  project=${project,,}
+  trap 'reuse_cleanup "$?"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  mkdir -- "$work/stage-data" "$work/backup" "$work/failed"
+  printf 'Marzban --reuse: preparing and testing a separate project.\n'
+  docker pull "$image" >/dev/null 2>&1 && docker pull "$xray_image" >/dev/null 2>&1 ||
+    reuse_fail 'could not pull the pinned Marzban and Xray images'
+  image_id=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image" 2>/dev/null) ||
+    reuse_fail 'could not resolve the Marzban image digest'
+  [[ $image_id == *@sha256:* ]] || reuse_fail 'the Marzban image has no registry digest'
+  xray_source=$(docker create "$xray_image") || reuse_fail 'could not stage the Xray binary'
+  docker cp "$xray_source:/usr/local/bin/xray" "$work/xray" || reuse_fail 'could not copy the Xray binary'
+  docker rm -v "$xray_source" >/dev/null
+  xray_source=''
+  chmod 700 "$work/xray"
+  keys=$(docker run --rm --network none "$xray_image" x25519 2>/dev/null) ||
+    reuse_fail 'Xray could not generate a REALITY key pair'
+  export VLESS_DOMAIN="$domain" XRAY_SEND_THROUGH=0.0.0.0
+  export XRAY_PIK XRAY_PBK XRAY_PATH
+  XRAY_PIK=$(sed -n 's/^PrivateKey: //p' <<< "$keys")
+  XRAY_PBK=$(sed -n 's/^Password (PublicKey): //p' <<< "$keys")
+  [[ $XRAY_PIK =~ ^[A-Za-z0-9_-]{43}$ && $XRAY_PBK =~ ^[A-Za-z0-9_-]{43}$ ]] ||
+    reuse_fail 'Xray returned an unexpected REALITY key format'
+  XRAY_PATH=$(openssl rand -hex 8)
+  write_xray_config python3 -c 'import os, sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' > "$work/xray_config.json"
+  unset keys XRAY_PIK XRAY_PBK
+  password=$(openssl rand -hex 24)
+  printf 'SUDO_USERNAME=admin\nSUDO_PASSWORD=%s\n' "$password" > "$work/admin.env"
+  printf 'username=admin&password=%s' "$password" > "$work/login-form"
+  unset password
+
+  reuse_write_compose stage none "$work/stage-data" no
+  reuse_write_compose live host "$data" unless-stopped
+  reuse_compose stage config --quiet && reuse_compose live config --quiet ||
+    reuse_fail 'Compose did not accept the prepared configuration'
+  reuse_compose stage up -d >/dev/null 2>&1 ||
+    reuse_fail 'could not start the isolated Marzban staging container'
+  reuse_wait reuse_panel_ready --unix-socket "$work/stage-data/marzban.socket" http://localhost/api/admin &&
+    docker exec "$project-stage" python -c 'import socket; socket.create_connection(("127.0.0.1", 443), 2).close()' >/dev/null 2>&1 &&
+    reuse_seed_panel || reuse_fail 'the isolated Marzban, Xray or panel initialization failed'
+  reuse_compose stage stop >/dev/null 2>&1 && reuse_compose stage rm --force >/dev/null 2>&1 ||
+    reuse_fail 'could not stop and remove the staging container'
+  rm -- "$work/login-form" "$work/auth-header"
+  [[ -f $work/stage-data/db.sqlite3 ]] || reuse_fail 'staging did not create a SQLite database'
+  reuse_compose live create >/dev/null 2>&1 || reuse_fail 'could not create the replacement Marzban container'
+  candidate=$(reuse_compose live ps -aq marzban)
+  [[ $candidate =~ ^[a-f0-9]{12,64}$ ]] || reuse_fail 'could not identify the prepared replacement container'
+  printf '%s\n' "$candidate" > "$work/container"
+  printf '%s\n' "$old" "$old_policy" "$data" > "$work/previous"
+
+  [[ $(reuse_discover) == "$discovery" ]] && reuse_xray_listener "$old" ||
+    reuse_fail 'the running topology or TCP 443 owner changed during preparation'
+  for file in "${db_files[@]}"; do
+    if [[ -L $data/$file || ( -e $data/$file && ! -f $data/$file ) ]]; then
+      reuse_fail "unexpected file type in shared Marzban directory: $file"
+    fi
+  done
+  [[ ! -L $data/marzban.socket && ( ! -e $data/marzban.socket || -S $data/marzban.socket ) ]] ||
+    reuse_fail 'the Marzban socket path is occupied by another file'
+
+  printf 'Marzban --reuse: switching TCP 443 to the prepared container.\n'
+  ln -sT -- "$work" "$pending"
+  if [[ -n $old ]]; then
+    docker update --restart no "$old" >/dev/null 2>&1 && docker stop "$old" >/dev/null 2>&1 ||
+      reuse_fail 'could not stop the previous Marzban container'
+  fi
+  reuse_xray_listener '' || reuse_fail 'TCP 443 remained busy after stopping the previous Marzban'
+  for file in "${db_files[@]}"; do
+    if [[ -f $data/$file ]]; then
+      mv -T -- "$data/$file" "$work/backup/$file"
+    fi
+  done
+  if [[ -S $data/marzban.socket ]]; then
+    rm -- "$data/marzban.socket"
+  fi
+  touch -- "$work/activating"
+  activated=1
+  for file in "${db_files[@]}"; do
+    if [[ -f $work/stage-data/$file ]]; then
+      mv -T -- "$work/stage-data/$file" "$data/$file"
+    fi
+  done
+  docker start "$candidate" >/dev/null 2>&1 || reuse_fail 'could not start the replacement Marzban'
+  reuse_wait reuse_panel_ready --unix-socket "$data/marzban.socket" http://localhost/api/admin ||
+    reuse_fail 'replacement Marzban did not become ready on its Unix socket'
+  reuse_wait reuse_xray_listener "$candidate" || reuse_fail 'the replacement Xray did not take ownership of TCP 443'
+  reuse_panel_ready "${via_caddy[@]}" "$panel_url" || reuse_fail 'Caddy could not reach the replacement panel'
+  reuse_photo_health --resolve "$domain:443:127.0.0.1" "$photo_url" &&
+    reuse_wait reuse_photo_health "$photo_url" ||
+    reuse_fail 'PhotoHunt failed the HTTPS health check after switching'
+  mv -T -- "$pending" "$root/current"
+  printf 'Marzban --reuse: PhotoHunt and the panel are healthy. Files: %s\n' "$work"
+)
+
+if [[ ${1:-} == --reuse ]]; then
+  if [[ $EUID -ne 0 ]]; then
+    reuse_fail 'please run as root'
+  fi
+  shift
+  marzban_reuse "$@"
+  exit
+fi
+
 # Check if script started as root
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root"
@@ -156,85 +719,7 @@ marzban_setup() {
   fi
   unzip -qo /tmp/xray.zip -d /opt/xray-vps-setup/xray-core
 
-  envsubst > ./marzban/xray_config.json <<'XRAYCFG'
-{
-  "log": {
-    "loglevel": "none"
-  },
-  "inbounds": [
-    {
-      "tag": "VLESS XHTTP REALITY",
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "vless",
-      "settings": {
-        "clients": [],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "security": "reality",
-        "realitySettings": {
-          "xver": 1,
-          "dest": "127.0.0.1:4123",
-          "serverNames": [
-            "$VLESS_DOMAIN"
-          ],
-          "privateKey": "$XRAY_PIK",
-          "publicKey": "$XRAY_PBK",
-          "shortIds": [
-            ""
-          ]
-        },
-        "xhttpSettings": {
-          "host": "$VLESS_DOMAIN",
-          "path": "/$XRAY_PATH"
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls"
-        ],
-        "routeOnly": true
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct",
-      "settings": {
-        "domainStrategy": "UseIPv4",
-        "sendThrough": "$XRAY_SEND_THROUGH"
-      }
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block"
-    }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "protocol": "bittorrent",
-        "outboundTag": "block"
-      }
-    ],
-    "domainStrategy": "IPIfNonMatch"
-  },
-  "dns": {
-    "servers": [
-      "1.1.1.1",
-      "8.8.8.8"
-    ],
-    "queryStrategy": "UseIPv4",
-    "disableFallback": false,
-    "tag": "dns-aux"
-  }
-}
-XRAYCFG
+  write_xray_config envsubst > ./marzban/xray_config.json
 }
 
 block_ip_geo_detect() {
